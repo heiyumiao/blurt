@@ -1892,8 +1892,23 @@ impl Engine {
                     if self.reformat_after.as_deref() == Some(t.id.as_str()) {
                         self.reformat_after = None;
                     }
-                    // nothing heard: the mic it listened with, and its recording goes
-                    let _ = std::fs::remove_file(t.wav());
+                    // Local diagnostic build: keep the actual WAV when ASR returns no words. Copies live outside
+                    // history pruning; leave the original alone even if diagnostic storage fails.
+                    let directory = paths::blurt_home().join("diagnostics").join("no-speech");
+                    match super::diagnostic_audio::retain_no_speech(&t.wav(), &directory) {
+                        Ok(saved) => {
+                            let metadata = json!({
+                                "reason": "no_speech", "started_at": t.wall.to_rfc3339(),
+                                "duration_seconds": wav_seconds(&saved), "sample_rate": SR,
+                                "asr_ms": t.asr_ms,
+                            });
+                            if let Err(error) = std::fs::write(saved.with_extension("json"), metadata.to_string()) {
+                                eprintln!("dictation diagnostic: metadata error: {error}");
+                            }
+                            eprintln!("dictation diagnostic: no-speech audio saved: {}", saved.display());
+                        }
+                        Err(error) => eprintln!("dictation diagnostic: both archive locations failed; original only temporarily retained: {error}"),
+                    }
                     island::send(&self.app, json!({"op": "live", "text": ""}));
                     let silent = nothing_heard::silent_mic(t.peak, t.frames);
                     let name = (!self.mic_name.is_empty()).then(|| self.mic_name.clone());
