@@ -3015,6 +3015,44 @@ def level_up(samples: np.ndarray) -> np.ndarray:
     return (samples * min(LEVEL_MAX_GAIN, LEVEL_PEAK / peak)).astype(samples.dtype, copy=False)
 
 
+def prepare_for_vad(samples: np.ndarray) -> np.ndarray:
+    """Centre a recognition copy before measuring quiet speech; a DC bias is not voice energy.
+    Keep the original recording intact. Bound amplified clicks to the PCM range, and keep the
+    existing gain ceiling and VAD gate so a silent or noisy input is never decoded unconditionally.
+    """
+    if len(samples) == 0:
+        return samples
+    centred = samples - np.asarray(np.mean(samples, dtype=np.float64), dtype=samples.dtype)
+    return np.clip(level_up(centred), -1.0, 1.0)
+
+
+def suppress_pops(samples: np.ndarray) -> np.ndarray:
+    """Reduce short blasts on a retry copy before estimating the speech gain."""
+    # Impulse response of a two-pole 120 Hz Butterworth high-pass at SR=16 kHz.
+    # By 384 samples (24 ms) the response is below PCM16 resolution. Convolution
+    # keeps the operation in NumPy without adding a dependency to the ASR worker.
+    feedforward = 0.967227282715
+    impulse = np.zeros(384, dtype=np.float64)
+    impulse[:3] = (feedforward, -2 * feedforward, feedforward)
+    for i in range(1, len(impulse)):
+        impulse[i] += 1.93338022588 * impulse[i - 1]
+        if i >= 2:
+            impulse[i] -= 0.935528904979 * impulse[i - 2]
+    filtered = np.convolve(samples, impulse.astype(samples.dtype))[:len(samples)]
+
+    # Apply a smooth gain envelope around bursts, so we don't clip individual
+    # samples or let a few loud frames set the gain for the rest of the take.
+    hop = SR // 100
+    frames = np.pad(filtered, (0, -len(filtered) % hop)).reshape(-1, hop)
+    rms = np.sqrt(np.mean(frames * frames, axis=1))
+    ceiling = max(0.012, 3.0 * float(np.percentile(rms, 90)))
+    gain = ceiling / np.maximum(ceiling, rms)
+    neighbors = np.pad(gain, (1, 1), mode="edge")
+    gain = np.minimum(np.minimum(neighbors[:-2], neighbors[1:-1]), neighbors[2:])
+    envelope = np.interp(np.arange(len(samples)), np.arange(len(gain)) * hop + hop / 2, gain)
+    return filtered * envelope.astype(samples.dtype)
+
+
 def transcribe_track(samples: np.ndarray, backend, name: str, workers: int, label: str | None = None,
                      quiet: bool = False):
     """VAD → chunks → backend. Returns ([(start, end, text, label[, language])], speech s, s that decoded to nothing).
@@ -3033,15 +3071,22 @@ def transcribe_track(samples: np.ndarray, backend, name: str, workers: int, labe
         # sentence (Windows dogfood 2026-11-02: −55 dBFS noise typed 我感觉我这个头发有点长。). The VAD says no speech →
         # nothing to decode, and the app says "No speech detected".
         # Only the ONNX build (Windows / Linux) is gated: the Mac's MLX model keeps its measured path, with no VAD pass
-        if 0 < dur <= backend.max_chunk:
-            gate = getattr(backend, "vad_gate", False)
-            if gate:
-                samples = level_up(samples)     # with the VAD deciding: a quiet voice at a usual level for both
-            chunks = [(0.0, dur)] if not gate or vad_segments(samples, max_speech=min(25, backend.max_chunk)) else []
+        gate = getattr(backend, "vad_gate", False)
+        if gate:
+            recorded = samples
+            samples = prepare_for_vad(recorded)
+            chunks = pause_spans(samples, backend.max_chunk)
+            # A short blast can make the quiet-speech pass skip gain entirely.
+            # Give an ordinary-length take one more gated attempt on a de-popped copy.
+            if not chunks and 0.25 <= dur <= 60.0 and np.any(samples):
+                samples = prepare_for_vad(suppress_pops(recorded))
+                chunks = pause_spans(samples, backend.max_chunk)
+        elif 0 < dur <= backend.max_chunk:
+            chunks = [(0.0, dur)]
         else:
             chunks = pause_spans(samples, backend.max_chunk)
     else:
-        samples = level_up(samples)
+        samples = prepare_for_vad(samples)
         segs = vad_segments(samples, max_speech=min(25, backend.max_chunk))
         chunks = group_chunks(segs, backend.max_chunk)
     sp = sum(e - s for s, e in chunks)

@@ -493,6 +493,103 @@ class QuietSpeech(unittest.TestCase):
             T.vad_segments = old
 
 
+class BiasedQuietSpeech(unittest.TestCase):
+    """A DC-biased quiet take must reach both the gate and decoder centred and levelled."""
+
+    tone = QuietSpeech.tone
+
+    def test_dc_is_removed_without_changing_the_original_recording(self):
+        x = self.tone(0.005) + np.float32(0.03)
+        original = x.copy()
+        y = T.prepare_for_vad(x)
+        np.testing.assert_array_equal(x, original)
+        self.assertEqual(y.dtype, x.dtype)
+        self.assertEqual(y.shape, x.shape)
+        self.assertAlmostEqual(float(y.mean()), 0.0, places=6)
+        self.assertAlmostEqual(float(np.abs(y).max()), 0.005 * T.LEVEL_MAX_GAIN, places=4)
+
+    def test_dc_only_stays_silent_and_transients_cannot_exceed_pcm_range(self):
+        self.assertEqual(T.prepare_for_vad(np.zeros(0, np.float32)).size, 0)
+        y = T.prepare_for_vad(np.full(SR, 0.03, np.float32))
+        self.assertEqual(float(np.abs(y).max()), 0.0)
+        x = self.tone(0.005) + np.float32(0.03)
+        x[100] = 0.99
+        self.assertLessEqual(float(np.abs(T.prepare_for_vad(x)).max()), 1.0)
+
+    def test_short_and_long_gated_takes_use_the_same_processed_audio(self):
+        from unittest.mock import patch
+        for seconds in (2, 22):
+            with self.subTest(seconds=seconds):
+                heard = []
+
+                class Gated(FakeBackend):
+                    whole_spans = True
+                    vad_gate = True
+                    max_chunk = 20
+
+                    def transcribe(self, x):
+                        heard.append(x.copy())
+                        return [(0.0, len(x) / SR, "ok", "en")]
+
+                x = self.tone(0.005, seconds) + np.float32(0.03)
+                original = x.copy()
+                vad_audio = []
+
+                def vad(audio, max_speech=25):
+                    vad_audio.append(audio.copy())
+                    return [(0.0, len(audio) / SR)] if abs(float(audio.mean())) < 1e-5 else []
+
+                with patch.object(T, "vad_segments", vad):
+                    results, speech, _ = T.transcribe_track(x, Gated(), "fake", 1, quiet=True)
+                self.assertTrue(results, "biased speech was rejected before decoding")
+                self.assertAlmostEqual(speech, seconds)
+                np.testing.assert_array_equal(x, original)
+                np.testing.assert_allclose(np.concatenate(heard), vad_audio[0], atol=1e-6)
+                self.assertAlmostEqual(float(np.abs(vad_audio[0]).max()), 0.16, places=4)
+
+
+class PopRecovery(unittest.TestCase):
+    def test_local_gate_retries_poppy_quiet_audio_once_and_only_decodes_detected_speech(self):
+        from unittest.mock import patch
+
+        x = QuietSpeech().tone(0.008)
+        x[SR:SR + SR // 20] += QuietSpeech().tone(0.32, 0.05)
+        saved = x.copy()
+
+        class Gated(FakeBackend):
+            whole_spans = True
+            vad_gate = True
+            max_chunk = 20
+
+        for first_detected, retry_detected in [(False, True), (False, False), (True, False)]:
+            with self.subTest(first_detected=first_detected, retry_detected=retry_detected):
+                trials = []
+                decoded = []
+
+                def vad(audio, max_speech=25):
+                    trials.append(audio.copy())
+                    detected = first_detected if len(trials) == 1 else retry_detected
+                    return [(0.2, 1.8)] if detected else []
+
+                def decode(backend, audio, start, end):
+                    decoded.append(audio.copy())
+                    return [(start, end, "ok")]
+
+                with patch.object(T, "vad_segments", vad), patch.object(T, "decode_chunk", decode):
+                    results, _, _ = T.transcribe_track(x, Gated(), "fake", 1, quiet=True)
+
+                self.assertEqual(len(trials), 1 if first_detected else 2)
+                self.assertEqual(bool(results), first_detected or retry_detected)
+                if results:
+                    np.testing.assert_array_equal(decoded[0], trials[-1])
+                if not first_detected:
+                    self.assertLess(float(trials[1][SR:SR + SR // 20].std()),
+                                    float(trials[0][SR:SR + SR // 20].std()))
+                    self.assertGreater(float(trials[1][:SR // 2].std()),
+                                       float(trials[0][:SR // 2].std()))
+                np.testing.assert_array_equal(x, saved)
+
+
 class Notes(unittest.TestCase):
     def setUp(self):
         self.patches = {"BACKENDS": T.BACKENDS, "vad_segments": T.vad_segments}

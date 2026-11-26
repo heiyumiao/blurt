@@ -369,6 +369,38 @@ Not measured: a real soft or far voice in a real room (the "voice" rows keep the
 spectrum; distance changes both), Fun-ASR-Nano (ONNX, the Windows and Linux default — it runs on neither this Mac
 nor its ARM build), and the user's own microphone.
 
+### DC-biased quiet input (2026-11-25)
+
+Two retained Windows takes (4.62 s and 22.56 s) returned no speech. Their mean PCM16 values were approximately
+926 and 562, respectively: the bias was counted as level before VAD, and the longer Fun-ASR-Nano path did not
+apply quiet-speech gain at all. Centring the recognition copy before the existing bounded gain restored text
+from both takes with the same installed Fun-ASR-Nano ONNX model. The exact device stage introducing the bias
+has not been established.
+
+`prepare_for_vad` subtracts the take's mean on a new array, applies `level_up`, and bounds amplified transients
+to the PCM range. Both VAD and decoding receive that array. The gated whole-span path does this before either
+the short-take gate or the long-take pause split. Non-whole local VAD paths share it; ungated whole-audio paths
+continue to receive the original samples. No VAD threshold is lowered, and saved WAVs are never rewritten.
+
+Local replay: two of three failed takes recovered text (the 3.08 s take remained blank); three previously
+successful takes still produced text. Two matched their previous transcript exactly; one 10-character take
+differed by one character, so this is evidence of recovered detection, not a claim of universally better
+transcription accuracy. All six original WAV hashes were unchanged. Private audio and transcripts are kept
+outside the repository. Regression tests cover DC-only silence, gain bounds, transient clipping, unchanged
+input arrays, and the same preprocessing reaching VAD and decoding for short and long takes.
+
+### Retry quiet speech with short peaks (2026-11-26)
+
+Three Windows takes (3.02–6.66 s) returned no speech even after centring. Their loudest 0.1% exceeded the
+quiet-gain threshold, although much of the voice was quiet. A 120 Hz high-pass by itself did not reliably
+recover them. Adding a brief RMS-based gain envelope around unusually loud frames let the existing quiet-gain
+pass recover speech from all three with the same installed Fun-ASR-Nano model.
+
+The gated whole-span path tries the normal audio first. If it detects no speech in a non-silent 0.25–60 s take,
+it filters a copy and retries the same gate once. Only audio accepted by the gate reaches the decoder. The
+retry runs in memory and does not write a second WAV. The original three failures returned text on local replay,
+two previously successful takes returned the same text, and two silent or too-short controls stayed blank.
+
 ## Permissions (the guide)
 
 Granting a permission used to mean System Settings, "+", and hunting for the app. The guide does what CleanShot,
