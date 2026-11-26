@@ -1,0 +1,14 @@
+name: Personal Windows build
+
+on:
+  push:
+    branches: [personal/windows]
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    uses: ./.github/workflows/desktop.yml
+    with:
+      windows_only: true
